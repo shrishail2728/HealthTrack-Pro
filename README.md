@@ -47,5 +47,4 @@ git clone https://github.com/mohin22/HealthTrack-Pro.git cd HealthTrack-Pro
 - Uses ThingSpeak REST API for posting real-time sensor data.
 - Visual dashboards created on ThingSpeak channels.
 
-## License
-This project is licensed under the MIT License.
+
