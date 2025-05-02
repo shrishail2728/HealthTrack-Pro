@@ -41,7 +41,7 @@ git clone https://github.com/mohin22/HealthTrack-Pro.git cd HealthTrack-Pro
 - `/src`: Main firmware code
 - `/include`: Header files
 - `/scripts`: Python utilities (e.g., plot_ecg.py)
-- `/docs`: Additional documentation
+- `platformio.ini`: Project Configuration file which includes library
 
 ## Cloud Integration
 - Uses ThingSpeak REST API for posting real-time sensor data.
