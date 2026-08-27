@@ -1,22 +1,35 @@
+// The SparkFun MAX3010x library uses a 32-byte I2C buffer. Define the same
+// value before Wire.h is included so the framework and library agree.
+#ifndef I2C_BUFFER_LENGTH
+#define I2C_BUFFER_LENGTH 32
+#endif
+
 #include <WiFi.h>
 #include "ThingSpeak.h"
+#include "secrets.h"
 #include <DHT.h>
 #include "MAX30105.h"
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <math.h>
 #include "heartRate.h"      // Maxim's heart rate algorithm
 #include "spo2_algorithm.h" // Maxim's SpO2 algorithm
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
-// Explicitly define I2C_BUFFER_LENGTH to avoid redefinition warning
-#define I2C_BUFFER_LENGTH 128
-
 // ---- DHT22 Config ----
 #define DHTPIN 4
 #define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
+
+// ---- DS18B20 Config ----
+// Connect the data wire to GPIO 5 and use a 4.7k pull-up resistor to 3.3V.
+#define DS18B20_PIN 5
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
 
 // ---- MAX30102 Config ----
 MAX30105 particleSensor;
@@ -38,38 +51,45 @@ struct SensorData
   float ecgBpm;
   float temperature;
   float humidity;
+  float probeTemperature;
   bool spo2_valid;
   bool hr_valid;
+  bool probeTemperature_valid;
 };
 
 // ---- Global Variables ----
-SensorData sensorData = {0, -999, 0, 0, 0, 0, false, false};
+SensorData sensorData = {0, -999, 0, 0, NAN, NAN, NAN, false, false, false};
 SemaphoreHandle_t dataMutex;
+SemaphoreHandle_t i2cMutex;
 
 // ---- MAX30102 Buffers ----
-#define BUFFER_SIZE 100 // Matches Maxim algorithm requirements
-uint32_t irBuffer[BUFFER_SIZE];
-uint32_t redBuffer[BUFFER_SIZE];
+#define PPG_BUFFER_SIZE 100 // Matches Maxim algorithm requirements
+uint32_t irBuffer[PPG_BUFFER_SIZE];
+uint32_t redBuffer[PPG_BUFFER_SIZE];
 int bufferIndex = 0;
 SemaphoreHandle_t bufferMutex;
+bool max30102Available = false;
+bool ds18b20Available = false;
 
 // ---- AD8232 Heartbeat Variables ----
 unsigned long lastEcgBeat = 0;
 const int ecgThreshold = 512; // Adjust this threshold as needed
+bool ecgAboveThreshold = false;
 
 // Wi-Fi configuration
-const char *ssid = "mohin";           // Replace with your Wi-Fi SSID
-const char *password = "jioairfiber"; // Replace with your Wi-Fi password
+const char *ssid = HEALTHTRACK_WIFI_SSID;
+const char *password = HEALTHTRACK_WIFI_PASSWORD;
 
 // ThingSpeak channel configuration
-unsigned long channelID = 2938936;       // Replace with your ThingSpeak channel ID
-const char *apiKey = "VLQSMNBV0G4AD7JW"; // Replace with your ThingSpeak write API key
+unsigned long channelID = HEALTHTRACK_THINGSPEAK_CHANNEL_ID;
+const char *apiKey = HEALTHTRACK_THINGSPEAK_API_KEY;
 
 WiFiClient client; // Create a WiFi client to send data to ThingSpeak
 
 // Function prototypes for FreeRTOS tasks
 void max30102Task(void *pvParameters);
 void dht22Task(void *pvParameters);
+void ds18b20Task(void *pvParameters);
 void ecgTask(void *pvParameters);
 void lcdTask(void *pvParameters);
 void thingSpeakTask(void *pvParameters);
@@ -82,14 +102,24 @@ void initializeSensors() {
     lcd.setCursor(0, 0);
     lcd.print("Sensor Error");
     Serial.println("MAX30102 not found. Check wiring.");
-    while (1);
+  } else {
+    particleSensor.setup(0x3F, 4, 2, 100, 411, 16384);
+    particleSensor.setPulseAmplitudeRed(0x3F);
+    particleSensor.setPulseAmplitudeIR(0x3F);
+    max30102Available = true;
   }
-  particleSensor.setup(0x3F, 4, 2, 100, 411, 16384);
-  particleSensor.setPulseAmplitudeRed(0x3F);
-  particleSensor.setPulseAmplitudeIR(0x3F);
 
   // --- DHT22 Setup ---
   dht.begin();
+
+  // --- DS18B20 Setup ---
+  ds18b20.begin();
+  ds18b20.setResolution(10);
+  ds18b20.setWaitForConversion(true);
+  ds18b20Available = ds18b20.getDeviceCount() > 0;
+  if (!ds18b20Available) {
+    Serial.println("DS18B20 not found. Check wiring and pull-up resistor.");
+  }
 
   // --- AD8232 Setup ---
   pinMode(ECG_PIN, INPUT);
@@ -121,7 +151,14 @@ void setup() {
 
   // Create mutexes
   dataMutex = xSemaphoreCreateMutex();
+  i2cMutex = xSemaphoreCreateMutex();
   bufferMutex = xSemaphoreCreateMutex();
+  if (dataMutex == NULL || i2cMutex == NULL || bufferMutex == NULL) {
+    Serial.println("Failed to create synchronization objects");
+    while (true) {
+      delay(1000);
+    }
+  }
 
   // --- LCD Setup ---
   lcd.init();
@@ -137,7 +174,7 @@ void setup() {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("WiFi Error");
-    while (1);
+    Serial.println("Starting in offline mode; sensor tasks remain active.");
   }
 
   // --- ThingSpeak Setup ---
@@ -146,6 +183,7 @@ void setup() {
   // --- Create FreeRTOS Tasks ---
   xTaskCreatePinnedToCore(max30102Task, "MAX30102 Task", 4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(dht22Task, "DHT22 Task", 2048, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(ds18b20Task, "DS18B20 Task", 2048, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(ecgTask, "ECG Task", 2048, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(lcdTask, "LCD Task", 2048, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(thingSpeakTask, "ThingSpeak Task", 4096, NULL, 1, NULL, 0);
@@ -155,60 +193,88 @@ void max30102Task(void *pvParameters)
 {
   while (1)
   {
-    // --- MAX30102 Sensor Readings ---
-    uint32_t irValue = particleSensor.getIR();
-    uint32_t redValue = particleSensor.getRed();
-
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    if (!max30102Available)
     {
-      if (irValue < 5000)
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    // --- MAX30102 Sensor Readings ---
+    uint32_t irValue = 0;
+    uint32_t redValue = 0;
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+      irValue = particleSensor.getIR();
+      redValue = particleSensor.getRed();
+      xSemaphoreGive(i2cMutex);
+    }
+    else
+    {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    if (irValue < 5000)
+    {
+      Serial.println("No finger detected (IR < 5000)");
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
       {
-        Serial.println("No finger detected (IR < 5000)");
         sensorData.bpm = 0;
         sensorData.spo2 = -999;
         sensorData.spo2_valid = false;
         sensorData.hr_valid = false;
         xSemaphoreGive(dataMutex);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        continue;
       }
-      xSemaphoreGive(dataMutex);
+      if (xSemaphoreTake(bufferMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+      {
+        bufferIndex = 0;
+        xSemaphoreGive(bufferMutex);
+      }
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
     }
 
-    // Save to buffer
+    int32_t spo2 = -999;
+    int8_t spo2Valid = 0;
+    int32_t heartRate = -999;
+    int8_t heartRateValid = 0;
+    bool bufferReady = false;
+
     if (xSemaphoreTake(bufferMutex, pdMS_TO_TICKS(100)) == pdTRUE)
     {
       irBuffer[bufferIndex] = irValue;
       redBuffer[bufferIndex] = redValue;
-      bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
+      bufferIndex++;
+      bufferReady = bufferIndex >= PPG_BUFFER_SIZE;
+
+      if (bufferReady)
+      {
+        maxim_heart_rate_and_oxygen_saturation(
+            irBuffer,
+            PPG_BUFFER_SIZE,
+            redBuffer,
+            &spo2,
+            &spo2Valid,
+            &heartRate,
+            &heartRateValid);
+        bufferIndex = 0;
+      }
       xSemaphoreGive(bufferMutex);
     }
 
-    // --- Maxim's Algorithm for BPM and SpO2 ---
-    if (bufferIndex == 0)
-    { // Buffer is full, process BPM and SpO2
-      int32_t spo2 = -999;
-      int8_t spo2_valid = 0;
-      int32_t heart_rate = -999;
-      int8_t hr_valid = 0;
-
-      if (xSemaphoreTake(bufferMutex, pdMS_TO_TICKS(100)) == pdTRUE)
-      {
-        maxim_heart_rate_and_oxygen_saturation(irBuffer, BUFFER_SIZE, redBuffer, &spo2, &spo2_valid, &heart_rate, &hr_valid);
-        xSemaphoreGive(bufferMutex);
-      }
-
+    if (bufferReady)
+    {
       if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
       {
         sensorData.spo2 = spo2;
-        sensorData.spo2_valid = spo2_valid;
-        sensorData.hr_valid = hr_valid;
-        if (hr_valid)
+        sensorData.spo2_valid = spo2Valid != 0;
+        sensorData.hr_valid = heartRateValid != 0;
+        if (heartRateValid)
         {
-          sensorData.bpm = heart_rate; // Store Maxim BPM
+          sensorData.bpm = heartRate; // Store Maxim BPM
           Serial.println("=== Heart Rate ===");
           Serial.print("Maxim BPM: ");
-          Serial.println(heart_rate);
+          Serial.println(heartRate);
         }
         else
         {
@@ -216,7 +282,7 @@ void max30102Task(void *pvParameters)
           Serial.println("Invalid Maxim BPM");
         }
         Serial.println("=== SpO2 ===");
-        if (spo2_valid)
+        if (spo2Valid)
         {
           Serial.print("SpO2 (%): ");
           Serial.println(spo2);
@@ -227,7 +293,6 @@ void max30102Task(void *pvParameters)
         }
         xSemaphoreGive(dataMutex);
       }
-      bufferIndex = 0; // Reset buffer index
     }
 
     vTaskDelay(pdMS_TO_TICKS(10)); // 100Hz sampling (10ms delay)
@@ -252,6 +317,51 @@ void dht22Task(void *pvParameters)
   }
 }
 
+void ds18b20Task(void *pvParameters)
+{
+  while (1)
+  {
+    if (!ds18b20Available)
+    {
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+      {
+        sensorData.probeTemperature = NAN;
+        sensorData.probeTemperature_valid = false;
+        xSemaphoreGive(dataMutex);
+      }
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
+
+    ds18b20.requestTemperatures();
+    float probeTemperature = ds18b20.getTempCByIndex(0);
+    bool valid = probeTemperature != DEVICE_DISCONNECTED_C &&
+                 !isnan(probeTemperature) &&
+                 probeTemperature >= -55.0f &&
+                 probeTemperature <= 125.0f;
+
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+      sensorData.probeTemperature = valid ? probeTemperature : NAN;
+      sensorData.probeTemperature_valid = valid;
+      xSemaphoreGive(dataMutex);
+    }
+
+    if (valid)
+    {
+      Serial.print("DS18B20 temperature: ");
+      Serial.print(probeTemperature, 2);
+      Serial.println(" C");
+    }
+    else
+    {
+      Serial.println("Invalid DS18B20 reading");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
 void ecgTask(void *pvParameters)
 {
   while (1)
@@ -259,84 +369,144 @@ void ecgTask(void *pvParameters)
     int ecgValue = analogRead(ECG_PIN);
     unsigned long now = millis();
 
-    if (ecgValue > ecgThreshold && (now - lastEcgBeat > 300))
+    bool leadsOff = digitalRead(LO_PLUS_PIN) == HIGH || digitalRead(LO_MINUS_PIN) == HIGH;
+    if (leadsOff)
     {
-      float newEcgBpm = 60000.0 / (now - lastEcgBeat);
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+      {
+        sensorData.ecgValue = 0;
+        sensorData.ecgBpm = 0;
+        xSemaphoreGive(dataMutex);
+      }
+      lastEcgBeat = 0;
+      ecgAboveThreshold = false;
+      Serial.println(0);
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    bool aboveThreshold = ecgValue > ecgThreshold;
+    if (aboveThreshold && !ecgAboveThreshold &&
+        (lastEcgBeat == 0 || now - lastEcgBeat > 300))
+    {
+      float newEcgBpm = lastEcgBeat == 0 ? 0 : 60000.0f / (now - lastEcgBeat);
       lastEcgBeat = now;
 
       if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
       {
         sensorData.ecgValue = ecgValue;
         sensorData.ecgBpm = newEcgBpm;
-        // Comment out BPM print
-        // Serial.print("Heartbeat! BPM (ECG): ");
-        // Serial.println(newEcgBpm);
         xSemaphoreGive(dataMutex);
       }
     }
+    else if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+      sensorData.ecgValue = ecgValue;
+      xSemaphoreGive(dataMutex);
+    }
 
-    // Always print raw ECG value for plotting
-    Serial.println(ecgValue); // <--- THIS LINE IS CRUCIAL
+    ecgAboveThreshold = aboveThreshold;
+
+    // Always print raw ECG value for plotting.
+    Serial.println(ecgValue);
 
     vTaskDelay(pdMS_TO_TICKS(10)); // 100Hz sampling
   }
 }
 
-void lcdTask(void *pvParameters) {
+void lcdTask(void *pvParameters)
+{
   static int displayState = 0;
-  SensorData lastDisplayedData = {0, -999, 0, 0, 0, 0, false, false};
-  while (1) {
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      if (memcmp(&sensorData, &lastDisplayedData, sizeof(SensorData)) != 0) { // Only update if data has changed
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        switch (displayState) {
-          case 0:
-            if (sensorData.hr_valid && sensorData.bpm > 0) {
-              lcd.print("BPM: ");
-              lcd.print((int)sensorData.bpm);
-            } else {
-              lcd.print("BPM: N/A");
-            }
-            break;
-          case 1:
-            if (sensorData.spo2_valid && sensorData.spo2 >= 0 && sensorData.spo2 <= 100) {
-              lcd.print("SpO2: ");
-              lcd.print(sensorData.spo2);
-              lcd.print("%");
-            } else {
-              lcd.print("SpO2: N/A");
-            }
-            break;
-          case 2:
-            if (!isnan(sensorData.temperature)) {
-              lcd.print("Temp: ");
-              lcd.print(sensorData.temperature, 1);
-              lcd.print((char)223);
-              lcd.print("C");
-            } else {
-              lcd.print("Temp: N/A");
-            }
-            break;
-          case 3:
-            if (!isnan(sensorData.humidity)) {
-              lcd.print("Hum: ");
-              lcd.print(sensorData.humidity, 0);
-              lcd.print("%");
-            } else {
-              lcd.print("Hum: N/A");
-            }
-            break;
-          case 4:
-            lcd.print("ECG: ");
-            lcd.print(sensorData.ecgValue);
-            break;
-        }
-        lastDisplayedData = sensorData; // Update last displayed data
-      }
+  while (1)
+  {
+    SensorData currentData;
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+      currentData = sensorData;
       xSemaphoreGive(dataMutex);
-      displayState = (displayState + 1) % 5;
     }
+    else
+    {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      switch (displayState)
+      {
+        case 0:
+          if (currentData.hr_valid && currentData.bpm > 0)
+          {
+            lcd.print("BPM: ");
+            lcd.print((int)currentData.bpm);
+          }
+          else
+          {
+            lcd.print("BPM: N/A");
+          }
+          break;
+        case 1:
+          if (currentData.spo2_valid && currentData.spo2 >= 0 && currentData.spo2 <= 100)
+          {
+            lcd.print("SpO2: ");
+            lcd.print(currentData.spo2);
+            lcd.print("%");
+          }
+          else
+          {
+            lcd.print("SpO2: N/A");
+          }
+          break;
+        case 2:
+          if (!isnan(currentData.temperature))
+          {
+            lcd.print("Temp: ");
+            lcd.print(currentData.temperature, 1);
+            lcd.print((char)223);
+            lcd.print("C");
+          }
+          else
+          {
+            lcd.print("Temp: N/A");
+          }
+          break;
+        case 3:
+          if (!isnan(currentData.humidity))
+          {
+            lcd.print("Hum: ");
+            lcd.print(currentData.humidity, 0);
+            lcd.print("%");
+          }
+          else
+          {
+            lcd.print("Hum: N/A");
+          }
+          break;
+        case 4:
+          lcd.print("ECG: ");
+          lcd.print(currentData.ecgValue);
+          break;
+        case 5:
+          if (currentData.probeTemperature_valid && !isnan(currentData.probeTemperature))
+          {
+            lcd.print("Probe: ");
+            lcd.print(currentData.probeTemperature, 1);
+            lcd.print((char)223);
+            lcd.print("C");
+          }
+          else
+          {
+            lcd.print("Probe: N/A");
+          }
+          break;
+      }
+      xSemaphoreGive(i2cMutex);
+    }
+
+    displayState = (displayState + 1) % 6;
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
@@ -345,37 +515,70 @@ void thingSpeakTask(void *pvParameters)
 {
   while (1)
   {
+    SensorData currentData;
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+      currentData = sensorData;
+      xSemaphoreGive(dataMutex);
+    }
+    else
+    {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+      Serial.println("WiFi disconnected; attempting reconnect");
+      connectToWiFi();
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
     {
       // Debug all parameters before sending
       Serial.println("=== ThingSpeak Update ===");
       Serial.print("Maxim BPM before send: ");
-      Serial.println(sensorData.bpm);
+      Serial.println(currentData.bpm);
       Serial.print("SpO2 before send: ");
-      Serial.print(sensorData.spo2);
+      Serial.print(currentData.spo2);
       Serial.print(", Valid: ");
-      Serial.println(sensorData.spo2_valid);
+      Serial.println(currentData.spo2_valid);
       Serial.print("ECG Value: ");
-      Serial.println(sensorData.ecgValue);
+      Serial.println(currentData.ecgValue);
       Serial.print("Temperature: ");
-      Serial.println(sensorData.temperature);
+      Serial.println(currentData.temperature);
       Serial.print("Humidity: ");
-      Serial.println(sensorData.humidity);
+      Serial.println(currentData.humidity);
+      Serial.print("Probe Temperature: ");
+      Serial.println(currentData.probeTemperature);
 
-      ThingSpeak.setField(1, sensorData.bpm); // Maxim BPM
-      if (sensorData.spo2_valid && sensorData.spo2 >= 0 && sensorData.spo2 <= 100)
+      if (currentData.hr_valid && currentData.bpm > 0)
       {
-        ThingSpeak.setField(2, sensorData.spo2);
+        ThingSpeak.setField(1, currentData.bpm); // Maxim BPM
+      }
+      if (currentData.spo2_valid && currentData.spo2 >= 0 && currentData.spo2 <= 100)
+      {
+        ThingSpeak.setField(2, currentData.spo2);
         Serial.print("Sending SpO2 to ThingSpeak: ");
-        Serial.println(sensorData.spo2);
+        Serial.println(currentData.spo2);
       }
       else
       {
         Serial.println("Skipping SpO2 send: Invalid or out-of-range value");
       }
-      ThingSpeak.setField(3, sensorData.ecgValue);
-      ThingSpeak.setField(4, sensorData.temperature);
-      ThingSpeak.setField(5, sensorData.humidity);
+      ThingSpeak.setField(3, currentData.ecgValue);
+      if (!isnan(currentData.temperature))
+      {
+        ThingSpeak.setField(4, currentData.temperature);
+      }
+      if (!isnan(currentData.humidity))
+      {
+        ThingSpeak.setField(5, currentData.humidity);
+      }
+      if (currentData.probeTemperature_valid && !isnan(currentData.probeTemperature))
+      {
+        ThingSpeak.setField(6, currentData.probeTemperature);
+      }
 
       int responseCode = ThingSpeak.writeFields(channelID, apiKey);
       if (responseCode == 200)
@@ -387,7 +590,10 @@ void thingSpeakTask(void *pvParameters)
         Serial.print("Error sending data to ThingSpeak: ");
         Serial.println(responseCode);
       }
-      xSemaphoreGive(dataMutex);
+    }
+    else
+    {
+      Serial.println("ThingSpeak update skipped: WiFi unavailable");
     }
 
     vTaskDelay(pdMS_TO_TICKS(20000)); // Update every 20 seconds
